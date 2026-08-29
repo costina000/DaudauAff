@@ -2,7 +2,7 @@
 <html lang="vi">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
   <meta name="theme-color" content="#f15b7f">
   <meta name="description" content="Sản phẩm được Đậu Đậu Family chọn lọc và giới thiệu.">
   <title>Đậu Đậu Family — Sản phẩm mình đề xuất</title>
@@ -20,89 +20,46 @@
         <div><span>🛍️</span><b>Cập nhật deal</b></div>
       </div>
     </header>
-
     <section class="title-band">
       <div class="eyebrow">🎁 GỢI Ý CHO MẸ & BÉ</div>
       <h2>Sản phẩm mình đề xuất</h2>
       <p>Những món đồ hữu ích mình muốn chia sẻ cùng bạn.</p>
     </section>
-
     <nav class="filters" id="filters" aria-label="Danh mục sản phẩm"></nav>
     <main><section class="product-grid" id="products" aria-live="polite"></section></main>
-
     <footer>
       <strong>💗 Cảm ơn bạn đã ủng hộ Đậu Đậu Family!</strong>
       <p>Mỗi lượt ghé xem sản phẩm qua link của mình là một động lực để mình chia sẻ thêm nhiều điều hữu ích.</p>
     </footer>
   </div>
-
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="supabase-config.js"></script>
   <script>
-    const state = { products: [], category: 'Tất cả' };
-    const $ = (selector) => document.querySelector(selector);
-
-    function escapeHtml(value = '') {
-      return String(value).replace(/[&<>'"]/g, (char) => ({
-        '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;'
-      }[char]));
+    const state={products:[],category:'Tất cả'};
+    const configured=window.SUPABASE_URL&&window.SUPABASE_ANON_KEY&&!window.SUPABASE_URL.includes('YOUR_')&&!window.SUPABASE_ANON_KEY.includes('YOUR_');
+    const client=configured?window.supabase.createClient(window.SUPABASE_URL,window.SUPABASE_ANON_KEY):null;
+    const $=s=>document.querySelector(s);
+    function escapeHtml(value=''){return String(value).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+    async function loadProducts(){
+      if(!client){$('#products').innerHTML='<div class="empty">Website đang được cấu hình. Vui lòng quay lại sau.</div>';return}
+      const {data,error}=await client.from('products').select('*').eq('active',true).order('sort_order',{ascending:true}).order('created_at',{ascending:false});
+      if(error){console.error(error);$('#products').innerHTML='<div class="empty">Không thể tải sản phẩm lúc này.</div>';return}
+      state.products=data||[];renderFilters();renderProducts();
     }
-
-    async function loadProducts() {
-      try {
-        const response = await fetch('products.json', { cache: 'no-store' });
-        if (!response.ok) throw new Error('Không tải được products.json');
-        state.products = await response.json();
-      } catch (error) {
-        console.error(error);
-        state.products = [];
-      }
-      renderFilters();
-      renderProducts();
+    function renderFilters(){
+      const categories=['Tất cả',...new Set(state.products.map(p=>p.category).filter(Boolean))];
+      if(!categories.includes(state.category))state.category='Tất cả';
+      $('#filters').innerHTML=categories.map(c=>`<button class="filter ${c===state.category?'active':''}" data-category="${escapeHtml(c)}">${escapeHtml(c)}</button>`).join('');
+      $('#filters').querySelectorAll('.filter').forEach(b=>b.addEventListener('click',()=>{state.category=b.dataset.category;renderFilters();renderProducts()}));
     }
-
-    function renderFilters() {
-      const categories = ['Tất cả', ...new Set(state.products.map((product) => product.category).filter(Boolean))];
-      $('#filters').innerHTML = categories.map((category) => `
-        <button class="filter ${category === state.category ? 'active' : ''}" data-category="${escapeHtml(category)}">${escapeHtml(category)}</button>
-      `).join('');
-      $('#filters').querySelectorAll('.filter').forEach((button) => {
-        button.addEventListener('click', () => {
-          state.category = button.dataset.category;
-          renderFilters();
-          renderProducts();
-        });
-      });
-    }
-
-    function renderProducts() {
-      const products = state.category === 'Tất cả'
-        ? state.products
-        : state.products.filter((product) => product.category === state.category);
-
-      if (!products.length) {
-        $('#products').innerHTML = '<div class="empty">Chưa có sản phẩm trong danh mục này.</div>';
-        return;
-      }
-
-      $('#products').innerHTML = products.map((product) => {
-        const image = product.image
-          ? `<img src="${escapeHtml(product.image)}" alt="${escapeHtml(product.name)}" loading="lazy">`
-          : `<div class="image-placeholder" aria-hidden="true">${escapeHtml(product.emoji || '🛍️')}</div>`;
-        const price = product.price ? `<div class="price">${escapeHtml(product.price)}</div>` : '';
-        const description = product.description ? `<p class="description">${escapeHtml(product.description)}</p>` : '';
-        return `
-          <article class="product-card">
-            <div class="product-image">${image}</div>
-            <div class="product-body">
-              <div class="category-label">${escapeHtml(product.category || 'Mẹ & Bé')}</div>
-              <h3>${escapeHtml(product.name)}</h3>
-              ${description}
-              ${price}
-              <a class="product-button" href="${escapeHtml(product.link || '#')}" target="_blank" rel="noopener noreferrer sponsored">XEM SẢN PHẨM <span>↗</span></a>
-            </div>
-          </article>`;
+    function renderProducts(){
+      const list=state.category==='Tất cả'?state.products:state.products.filter(p=>p.category===state.category);
+      if(!list.length){$('#products').innerHTML='<div class="empty">Chưa có sản phẩm.</div>';return}
+      $('#products').innerHTML=list.map(p=>{
+        const image=p.image_url?`<img src="${escapeHtml(p.image_url)}" alt="${escapeHtml(p.name)}" loading="lazy">`:'<div class="image-placeholder">🛍️</div>';
+        return `<article class="product-card"><div class="product-image">${image}</div><div class="product-body"><div class="category-label">${escapeHtml(p.category||'Mẹ & Bé')}</div><h3>${escapeHtml(p.name)}</h3>${p.description?`<p class="description">${escapeHtml(p.description)}</p>`:''}${p.price?`<div class="price">${escapeHtml(p.price)}</div>`:''}<a class="product-button" href="${escapeHtml(p.affiliate_url)}" target="_blank" rel="noopener noreferrer sponsored">XEM SẢN PHẨM <span>↗</span></a></div></article>`;
       }).join('');
     }
-
     loadProducts();
   </script>
 </body>
