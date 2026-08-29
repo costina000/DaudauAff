@@ -35,11 +35,7 @@ function isShortTikTokUrl(value: string) {
   try {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
-    return (
-      host === 'vt.tiktok.com' ||
-      host === 'vm.tiktok.com' ||
-      host === 't.tiktok.com'
-    );
+    return host === 'vt.tiktok.com' || host === 'vm.tiktok.com' || host === 't.tiktok.com';
   } catch {
     return false;
   }
@@ -50,6 +46,7 @@ function extractMeta(html: string, property: string): string {
   const patterns = [
     new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i'),
     new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${escaped}["'][^>]*>`, 'i'),
+    new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i'),
   ];
 
   for (const pattern of patterns) {
@@ -74,33 +71,29 @@ function extractCanonical(html: string): string {
   return '';
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function getOembed(url: string) {
-  const endpoint = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
-  const response = await fetch(endpoint, {
-    headers: { Accept: 'application/json', 'User-Agent': browserHeaders['User-Agent'] },
-    redirect: 'follow',
-  });
-
-  if (!response.ok) return null;
-
   try {
-    return await response.json();
+    const endpoint = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
+    const response = await fetch(endpoint, {
+      headers: { Accept: 'application/json', 'User-Agent': browserHeaders['User-Agent'] },
+      redirect: 'follow',
+    });
+
+    if (!response.ok) return null;
+    const json = await response.json();
+    return json?.thumbnail_url ? json : null;
   } catch {
     return null;
   }
 }
 
-/**
- * TikTok's official oEmbed endpoint does not reliably accept vt/vm short links.
- * Use TikWM only as a metadata fallback for short links, then fall back to
- * TikTok oEmbed/page metadata for normal canonical URLs.
- */
-async function getShortLinkMetadata(url: string) {
+async function getTikwmMetadata(url: string) {
   try {
-    const body = new URLSearchParams();
-    body.set('url', url);
-    body.set('hd', '1');
-
+    const body = new URLSearchParams({ url, hd: '1' });
     const response = await fetch('https://www.tikwm.com/api/', {
       method: 'POST',
       headers: {
@@ -117,54 +110,96 @@ async function getShortLinkMetadata(url: string) {
     if (json?.code !== 0 || !json?.data) return null;
 
     const data = json.data;
+    const thumbnail = data.cover || data.origin_cover || data.dynamic_cover || '';
+    if (!thumbnail) return null;
+
     return {
-      thumbnail_url: data.cover ?? data.origin_cover ?? '',
-      title: data.title ?? '',
-      author_name: data.author?.nickname ?? data.author?.unique_id ?? '',
+      thumbnail_url: thumbnail,
+      title: data.title || '',
+      author_name: data.author?.nickname || data.author?.unique_id || '',
       author_url: data.author?.unique_id
         ? `https://www.tiktok.com/@${data.author.unique_id}`
         : '',
-      video_url: data.share_url ?? url,
+      video_url: data.share_url || url,
       input_url: url,
+      source: 'tikwm',
     };
   } catch {
     return null;
   }
 }
 
+async function getShortLinkMetadata(url: string) {
+  // TikTok itself notes that share links can be temporarily unavailable just
+  // after they are created. TikWM also documents a short-link delay, so retry
+  // automatically instead of asking the user to do anything manually.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await getTikwmMetadata(url);
+    if (result) return result;
+    if (attempt < 2) await sleep(1500 * (attempt + 1));
+  }
+  return null;
+}
+
 async function resolveUrl(inputUrl: string): Promise<string> {
   let currentUrl = inputUrl;
 
   for (let i = 0; i < 6; i++) {
-    const response = await fetch(currentUrl, {
-      method: 'GET',
-      headers: browserHeaders,
-      redirect: 'manual',
-    });
+    try {
+      const response = await fetch(currentUrl, {
+        method: 'GET',
+        headers: browserHeaders,
+        redirect: 'manual',
+      });
 
-    const location = response.headers.get('location');
-    if (location) {
+      const location = response.headers.get('location');
+      if (!location) return currentUrl;
+
       const nextUrl = new URL(location, currentUrl).toString();
+      const next = new URL(nextUrl);
 
-      // TikTok sometimes redirects bots to the homepage. Do not treat that
-      // homepage as the resolved video URL.
-      try {
-        const next = new URL(nextUrl);
-        if (next.hostname === 'www.tiktok.com' && next.pathname === '/') {
-          return currentUrl;
-        }
-      } catch {
-        // Ignore malformed redirect and keep the current URL.
+      // TikTok sometimes redirects automated requests to its homepage.
+      // Never treat that homepage as the video URL.
+      if (next.hostname === 'www.tiktok.com' && next.pathname === '/') {
+        return currentUrl;
       }
 
       currentUrl = nextUrl;
-      continue;
+    } catch {
+      return currentUrl;
     }
-
-    return currentUrl;
   }
 
   return currentUrl;
+}
+
+async function getPageMetadata(url: string) {
+  try {
+    const response = await fetch(url, {
+      headers: browserHeaders,
+      redirect: 'follow',
+    });
+
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const thumbnail =
+      extractMeta(html, 'og:image') ||
+      extractMeta(html, 'twitter:image') ||
+      extractMeta(html, 'twitter:image:src');
+
+    if (!thumbnail) return null;
+
+    return {
+      thumbnail_url: thumbnail,
+      title: extractMeta(html, 'og:title'),
+      video_url: extractCanonical(html) || url,
+      input_url: url,
+      source: 'tiktok-page',
+    };
+  } catch {
+    return null;
+  }
 }
 
 Deno.serve(async (req) => {
@@ -178,9 +213,7 @@ Deno.serve(async (req) => {
 
   try {
     const authorization = req.headers.get('Authorization');
-    if (!authorization) {
-      return jsonResponse({ error: 'Unauthorized' }, 401);
-    }
+    if (!authorization) return jsonResponse({ error: 'Unauthorized' }, 401);
 
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
@@ -193,85 +226,70 @@ Deno.serve(async (req) => {
       error: authError,
     } = await supabase.auth.getUser();
 
-    if (authError || !user) {
-      return jsonResponse({ error: 'Unauthorized' }, 401);
-    }
+    if (authError || !user) return jsonResponse({ error: 'Unauthorized' }, 401);
 
     const body = await req.json();
     const inputUrl = String(body?.url ?? '').trim();
 
-    if (!inputUrl) {
-      return jsonResponse({ error: 'Missing TikTok URL' }, 400);
-    }
+    if (!inputUrl) return jsonResponse({ error: 'Missing TikTok URL' }, 400);
+    if (!isTikTokUrl(inputUrl)) return jsonResponse({ error: 'Invalid TikTok URL' }, 400);
 
-    if (!isTikTokUrl(inputUrl)) {
-      return jsonResponse({ error: 'Invalid TikTok URL' }, 400);
-    }
-
-    // Short links are handled first by a metadata resolver because TikTok's
-    // official oEmbed endpoint does not reliably resolve vt/vm links.
+    // 1. Short share links: use the metadata resolver first and retry
+    // automatically because newly-created TikTok share links can be delayed.
     if (isShortTikTokUrl(inputUrl)) {
       const shortMetadata = await getShortLinkMetadata(inputUrl);
-      if (shortMetadata?.thumbnail_url) {
-        return jsonResponse(shortMetadata);
-      }
+      if (shortMetadata) return jsonResponse(shortMetadata);
     }
 
-    // Try TikTok's official oEmbed endpoint directly.
+    // 2. Official TikTok oEmbed for canonical URLs (and as a second attempt).
     let data = await getOembed(inputUrl);
     let resolvedUrl = inputUrl;
 
-    // If the input is a normal canonical URL, oEmbed should be enough.
-    // For other TikTok links, try resolving the redirect and then oEmbed.
-    if (!data) {
-      resolvedUrl = await resolveUrl(inputUrl);
-      if (isTikTokUrl(resolvedUrl) && resolvedUrl !== inputUrl) {
-        data = await getOembed(resolvedUrl);
-      }
-    }
-
-    let thumbnailUrl = data?.thumbnail_url ?? '';
-    let title = data?.title ?? '';
-    let authorName = data?.author_name ?? '';
-    let authorUrl = data?.author_url ?? '';
-    let canonicalUrl = resolvedUrl;
-
-    if (!thumbnailUrl) {
-      const pageResponse = await fetch(resolvedUrl, {
-        headers: browserHeaders,
-        redirect: 'follow',
-      });
-
-      if (pageResponse.ok) {
-        const html = await pageResponse.text();
-
-        thumbnailUrl =
-          extractMeta(html, 'og:image') ||
-          extractMeta(html, 'twitter:image') ||
-          extractMeta(html, 'twitter:image:src');
-
-        title = title || extractMeta(html, 'og:title');
-        canonicalUrl = extractCanonical(html) || canonicalUrl;
-      }
-    }
-
-    if (!thumbnailUrl) {
+    if (data?.thumbnail_url) {
       return jsonResponse({
-        error: 'TikTok thumbnail could not be fetched',
+        thumbnail_url: data.thumbnail_url,
+        title: data.title || '',
+        author_name: data.author_name || '',
+        author_url: data.author_url || '',
+        video_url: inputUrl,
         input_url: inputUrl,
-        resolved_url: resolvedUrl,
-        hint: 'The TikTok link may be private, unavailable, expired, or blocked from automated metadata requests.',
-      }, 502);
+        source: 'tiktok-oembed',
+      });
+    }
+
+    resolvedUrl = await resolveUrl(inputUrl);
+
+    if (resolvedUrl !== inputUrl && isTikTokUrl(resolvedUrl)) {
+      data = await getOembed(resolvedUrl);
+      if (data?.thumbnail_url) {
+        return jsonResponse({
+          thumbnail_url: data.thumbnail_url,
+          title: data.title || '',
+          author_name: data.author_name || '',
+          author_url: data.author_url || '',
+          video_url: resolvedUrl,
+          input_url: inputUrl,
+          source: 'tiktok-oembed-resolved',
+        });
+      }
+    }
+
+    // 3. Last metadata fallback for canonical URLs.
+    const pageMetadata = await getPageMetadata(resolvedUrl);
+    if (pageMetadata) {
+      return jsonResponse({
+        ...pageMetadata,
+        author_name: '',
+        author_url: '',
+      });
     }
 
     return jsonResponse({
-      thumbnail_url: thumbnailUrl,
-      title,
-      author_name: authorName,
-      author_url: authorUrl,
-      video_url: canonicalUrl,
+      error: 'TikTok thumbnail could not be fetched automatically',
       input_url: inputUrl,
-    });
+      resolved_url: resolvedUrl,
+      hint: 'The video may be private, deleted, unavailable, or temporarily blocked by TikTok.',
+    }, 502);
   } catch (error) {
     return jsonResponse({
       error: error instanceof Error ? error.message : 'Unexpected error',
