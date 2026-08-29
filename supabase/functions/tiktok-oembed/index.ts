@@ -31,30 +31,22 @@ function isTikTokUrl(value: string) {
   }
 }
 
-async function resolveUrl(inputUrl: string): Promise<string> {
-  let currentUrl = inputUrl;
-
-  for (let i = 0; i < 6; i++) {
-    const response = await fetch(currentUrl, {
-      method: 'GET',
-      headers: browserHeaders,
-      redirect: 'manual',
-    });
-
-    const location = response.headers.get('location');
-    if (location) {
-      currentUrl = new URL(location, currentUrl).toString();
-      continue;
-    }
-
-    return currentUrl;
+function isShortTikTokUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return (
+      host === 'vt.tiktok.com' ||
+      host === 'vm.tiktok.com' ||
+      host === 't.tiktok.com'
+    );
+  } catch {
+    return false;
   }
-
-  return currentUrl;
 }
 
 function extractMeta(html: string, property: string): string {
-  const escaped = property.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const escaped = property.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
   const patterns = [
     new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']+)["'][^>]*>`, 'i'),
     new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']${escaped}["'][^>]*>`, 'i'),
@@ -98,6 +90,83 @@ async function getOembed(url: string) {
   }
 }
 
+/**
+ * TikTok's official oEmbed endpoint does not reliably accept vt/vm short links.
+ * Use TikWM only as a metadata fallback for short links, then fall back to
+ * TikTok oEmbed/page metadata for normal canonical URLs.
+ */
+async function getShortLinkMetadata(url: string) {
+  try {
+    const body = new URLSearchParams();
+    body.set('url', url);
+    body.set('hd', '1');
+
+    const response = await fetch('https://www.tikwm.com/api/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+        'User-Agent': browserHeaders['User-Agent'],
+      },
+      body: body.toString(),
+    });
+
+    if (!response.ok) return null;
+
+    const json = await response.json();
+    if (json?.code !== 0 || !json?.data) return null;
+
+    const data = json.data;
+    return {
+      thumbnail_url: data.cover ?? data.origin_cover ?? '',
+      title: data.title ?? '',
+      author_name: data.author?.nickname ?? data.author?.unique_id ?? '',
+      author_url: data.author?.unique_id
+        ? `https://www.tiktok.com/@${data.author.unique_id}`
+        : '',
+      video_url: data.share_url ?? url,
+      input_url: url,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveUrl(inputUrl: string): Promise<string> {
+  let currentUrl = inputUrl;
+
+  for (let i = 0; i < 6; i++) {
+    const response = await fetch(currentUrl, {
+      method: 'GET',
+      headers: browserHeaders,
+      redirect: 'manual',
+    });
+
+    const location = response.headers.get('location');
+    if (location) {
+      const nextUrl = new URL(location, currentUrl).toString();
+
+      // TikTok sometimes redirects bots to the homepage. Do not treat that
+      // homepage as the resolved video URL.
+      try {
+        const next = new URL(nextUrl);
+        if (next.hostname === 'www.tiktok.com' && next.pathname === '/') {
+          return currentUrl;
+        }
+      } catch {
+        // Ignore malformed redirect and keep the current URL.
+      }
+
+      currentUrl = nextUrl;
+      continue;
+    }
+
+    return currentUrl;
+  }
+
+  return currentUrl;
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -139,21 +208,28 @@ Deno.serve(async (req) => {
       return jsonResponse({ error: 'Invalid TikTok URL' }, 400);
     }
 
-    // 1. Resolve vt.tiktok.com / vm.tiktok.com short links.
-    const resolvedUrl = await resolveUrl(inputUrl);
-
-    if (!isTikTokUrl(resolvedUrl)) {
-      return jsonResponse({
-        error: 'Could not resolve TikTok URL',
-        input_url: inputUrl,
-        resolved_url: resolvedUrl,
-      }, 502);
+    // Short links are handled first by a metadata resolver because TikTok's
+    // official oEmbed endpoint does not reliably resolve vt/vm links.
+    if (isShortTikTokUrl(inputUrl)) {
+      const shortMetadata = await getShortLinkMetadata(inputUrl);
+      if (shortMetadata?.thumbnail_url) {
+        return jsonResponse(shortMetadata);
+      }
     }
 
-    // 2. Try TikTok's official oEmbed endpoint using the resolved URL.
-    let data = await getOembed(resolvedUrl);
+    // Try TikTok's official oEmbed endpoint directly.
+    let data = await getOembed(inputUrl);
+    let resolvedUrl = inputUrl;
 
-    // 3. If oEmbed fails, fetch the TikTok page and read its Open Graph metadata.
+    // If the input is a normal canonical URL, oEmbed should be enough.
+    // For other TikTok links, try resolving the redirect and then oEmbed.
+    if (!data) {
+      resolvedUrl = await resolveUrl(inputUrl);
+      if (isTikTokUrl(resolvedUrl) && resolvedUrl !== inputUrl) {
+        data = await getOembed(resolvedUrl);
+      }
+    }
+
     let thumbnailUrl = data?.thumbnail_url ?? '';
     let title = data?.title ?? '';
     let authorName = data?.author_name ?? '';
@@ -181,10 +257,10 @@ Deno.serve(async (req) => {
 
     if (!thumbnailUrl) {
       return jsonResponse({
-        error: 'TikTok did not return a thumbnail',
+        error: 'TikTok thumbnail could not be fetched',
         input_url: inputUrl,
         resolved_url: resolvedUrl,
-        hint: 'TikTok may be blocking automated requests for this video. The link itself was resolved successfully.',
+        hint: 'The TikTok link may be private, unavailable, expired, or blocked from automated metadata requests.',
       }, 502);
     }
 
