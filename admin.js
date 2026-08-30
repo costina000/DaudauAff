@@ -12,8 +12,38 @@ const form=document.querySelector('#productForm'),imageFile=document.querySelect
 imageFile.addEventListener('change',()=>{const file=imageFile.files[0];if(!file){imagePreview.innerHTML='';return}if(file.size>5*1024*1024){imageFile.value='';imagePreview.innerHTML='<small>Ảnh vượt quá 5MB.</small>';return}imagePreview.innerHTML=`<img src="${URL.createObjectURL(file)}" alt="Xem trước ảnh">`});
 function isTikTokUrl(url){try{const u=new URL(url);const host=u.hostname.toLowerCase();return host==='tiktok.com'||host.endsWith('.tiktok.com')}catch{return false}}
 let thumbnailTimer;
-async function fetchTikTokThumbnail(url){videoPreview.innerHTML='<div class="video-loading">⏳ Đang lấy thumbnail TikTok...</div>';if(!url){videoThumbnail.value='';videoPreview.innerHTML='';return}if(!isTikTokUrl(url)){videoThumbnail.value='';videoPreview.innerHTML='<small>Vui lòng nhập link video TikTok hợp lệ.</small>';return}try{const {data,error}=await client.functions.invoke('tiktok-oembed',{body:{url}});if(error)throw new Error(error.message||'Không gọi được dịch vụ thumbnail.');if(!data?.thumbnail_url)throw new Error(data?.error||'TikTok không trả về thumbnail.');videoThumbnail.value=data.thumbnail_url;videoPreview.innerHTML=`<img src="${esc(data.thumbnail_url)}" alt="Thumbnail TikTok"><div class="video-meta"><b>${esc(data.title||'Video TikTok')}</b><small>Thumbnail lấy từ TikTok</small></div>`}catch(error){videoPreview.innerHTML=`<small>Không lấy được thumbnail tự động. Hãy kiểm tra Edge Function “tiktok-oembed” đã được deploy. (${esc(error.message)})</small>`}}
-videoUrl.addEventListener('input',()=>{clearTimeout(thumbnailTimer);const url=videoUrl.value.trim();thumbnailTimer=setTimeout(()=>fetchTikTokThumbnail(url),500)});
+async function fetchTikTokThumbnail(url){
+  videoPreview.innerHTML='<div class="video-loading">⏳ Đang mở TikTok và lấy thông tin video...</div>';
+  if(!url){videoThumbnail.value='';videoPreview.innerHTML='';return}
+  if(!isTikTokUrl(url)){videoThumbnail.value='';videoPreview.innerHTML='<small>Vui lòng nhập link video TikTok hợp lệ.</small>';return}
+  try{
+    const {data,error}=await client.functions.invoke('tiktok-oembed',{body:{url}});
+    if(error)throw new Error(error.message||'Không gọi được dịch vụ TikTok.');
+    if(!data?.success)throw new Error(data?.error||'Không lấy được thông tin TikTok.');
+
+    const resolvedUrl=String(data.resolved_url||data.canonical_url||url).trim();
+    const thumbnailUrl=String(data.thumbnail_url||'').trim();
+    const title=String(data.title||'Video TikTok').trim();
+    const directVideoUrl=String(data.direct_video_url||'').trim();
+
+    // Lưu URL TikTok đầy đủ thay cho short link.
+    if(resolvedUrl&&isTikTokUrl(resolvedUrl)){
+      videoUrl.value=resolvedUrl;
+    }
+
+    videoThumbnail.value=thumbnailUrl;
+
+    const image=thumbnailUrl?`<img src="${esc(thumbnailUrl)}" alt="Thumbnail TikTok">`:'';
+    const openLink=resolvedUrl?`<a href="${esc(resolvedUrl)}" target="_blank" rel="noopener noreferrer">Mở video TikTok ↗</a>`:'';
+    const mediaStatus=directVideoUrl?'Đã phát hiện URL media trực tiếp.':'Đã lấy được URL video TikTok.';
+
+    videoPreview.innerHTML=`${image}<div class="video-meta"><b>${esc(title)}</b><small>✅ ${esc(mediaStatus)}</small>${openLink}</div>`;
+  }catch(error){
+    videoThumbnail.value='';
+    videoPreview.innerHTML=`<small>Không lấy được thông tin TikTok tự động. Hãy kiểm tra Edge Function “tiktok-oembed” và BROWSERLESS_TOKEN. (${esc(error.message)})</small>`
+  }
+}
+videoUrl.addEventListener('input',()=>{clearTimeout(thumbnailTimer);const url=videoUrl.value.trim();thumbnailTimer=setTimeout(()=>fetchTikTokThumbnail(url),700)});
 videoUrl.addEventListener('blur',()=>fetchTikTokThumbnail(videoUrl.value.trim()));
 async function uploadImage(file){const ext=(file.name.split('.').pop()||'jpg').toLowerCase();const path=`${crypto.randomUUID()}.${ext}`;const {error}=await client.storage.from('product-images').upload(path,file,{cacheControl:'3600',upsert:false,contentType:file.type});if(error)throw error;return client.storage.from('product-images').getPublicUrl(path).data.publicUrl}
 function renderCategoryList(){const cats=[...new Set(productsCache.map(p=>p.category).filter(Boolean))].sort((a,b)=>a.localeCompare(b,'vi'));document.querySelector('#categoryList').innerHTML=cats.map(c=>`<option value="${esc(c)}">`).join('')}
